@@ -19,8 +19,6 @@ Parámetros de la hoja (fijos, definidos por el formato del examen):
 import numpy as np
 import cv2
 
-DARK_THRESHOLD = 150
-
 N_SECTIONS = 4
 LETTERS = ["A", "B", "C", "D"]
 N_QUESTIONS = 25
@@ -104,8 +102,10 @@ def _kmeans_1d(values, k) -> np.ndarray:
 
 def build_bubble_grid(img: np.ndarray) -> dict:
     """Detecta y agrupa los 400 círculos de la hoja. Devuelve
-    {seccion: {pregunta: {letra: (x, y, w, h)}}}. Lanza OmrError si el
-    conteo no coincide con el formato esperado de la hoja."""
+    {seccion: {pregunta: {letra: (cx, cy, r)}}} (centro y radio del círculo,
+    no un rectángulo) para poder medir solo el interior del círculo y evitar
+    contar el propio borde impreso. Lanza OmrError si el conteo no coincide
+    con el formato esperado de la hoja."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     h = gray.shape[0]
 
@@ -146,28 +146,40 @@ def build_bubble_grid(img: np.ndarray) -> dict:
 
             options = {}
             for letter, gi in zip(LETTERS, row_idx):
-                cx, cy, r = xs[gi], ys[gi], radii[gi]
-                pad = r * 1.3
-                x0, y0 = int(cx - pad), int(cy - pad)
-                bw, bh = int(pad * 2), int(pad * 2)
-                options[letter] = (x0, y0, bw, bh)
+                options[letter] = (float(xs[gi]), float(ys[gi]), float(radii[gi]))
 
             grid[sec_name][q_num] = options
 
     return grid
 
 
-def _darkness_score(gray: np.ndarray, roi) -> float:
-    x, y, w, h = roi
-    region = gray[max(y, 0) : y + h, max(x, 0) : x + w]
-    if region.size == 0:
-        return 0.0
-    return float(np.count_nonzero(region < DARK_THRESHOLD)) / region.size
+def _fill_intensity(gray: np.ndarray, circle, inner_ratio: float = 0.7) -> float:
+    """Intensidad promedio de gris dentro del círculo (excluyendo el propio
+    anillo impreso, midiendo solo el interior). Menor valor = más tinta."""
+    cx, cy, r = circle
+    inner_r = max(1, int(r * inner_ratio))
+    x0, y0 = int(cx - inner_r), int(cy - inner_r)
+    x1, y1 = int(cx + inner_r), int(cy + inner_r)
+
+    h, w = gray.shape
+    x0c, y0c = max(x0, 0), max(y0, 0)
+    x1c, y1c = min(x1, w), min(y1, h)
+    patch = gray[y0c:y1c, x0c:x1c]
+    if patch.size == 0:
+        return 255.0
+
+    mask = np.zeros(patch.shape, dtype=np.uint8)
+    center_local = (int(cx) - x0c, int(cy) - y0c)
+    cv2.circle(mask, center_local, inner_r, 255, thickness=-1)
+
+    mean_val = cv2.mean(patch, mask=mask)[0]
+    return float(mean_val)
 
 
 def read_answers(img: np.ndarray) -> dict:
     """Punto de entrada principal: detecta la cuadrícula y lee la respuesta
-    marcada (mayor proporción de tinta) para cada pregunta de cada sección."""
+    marcada (menor intensidad promedio = más tinta = respuesta elegida) para
+    cada pregunta de cada sección."""
     grid = build_bubble_grid(img)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
@@ -175,7 +187,7 @@ def read_answers(img: np.ndarray) -> dict:
     for section, questions in grid.items():
         respuestas[section] = {}
         for q_num, options in questions.items():
-            scores = {letter: _darkness_score(gray, roi) for letter, roi in options.items()}
-            respuestas[section][q_num] = max(scores, key=scores.get)
+            scores = {letter: _fill_intensity(gray, circle) for letter, circle in options.items()}
+            respuestas[section][q_num] = min(scores, key=scores.get)
 
     return respuestas
