@@ -80,6 +80,27 @@ def _merge_close_circles(circles, median_r, merge_dist_factor=0.6):
     return merged
 
 
+def _remove_isolated_circles(circles, factor: float = 2.5):
+    """Descarta círculos "sueltos" que no tienen ningún vecino cercano (p. ej.
+    una palabra que el alumno circuló a mano en el nombre): en la cuadrícula
+    real, cada círculo de respuesta siempre tiene otros círculos muy cerca
+    (misma fila/columna), mientras que una marca aislada no."""
+    if len(circles) < 2:
+        return circles
+
+    xs = np.array([c[0] for c in circles])
+    ys = np.array([c[1] for c in circles])
+    nearest = []
+    for i in range(len(circles)):
+        dists = np.hypot(xs - xs[i], ys - ys[i])
+        dists[i] = np.inf
+        nearest.append(dists.min())
+    nearest = np.array(nearest)
+    median_nearest = float(np.median(nearest))
+
+    return [c for c, d in zip(circles, nearest) if d <= median_nearest * factor]
+
+
 def _detect_circles(gray: np.ndarray, y_min: int):
     raw = _detect_raw_circles(gray, y_min)
     if not raw:
@@ -87,7 +108,8 @@ def _detect_circles(gray: np.ndarray, y_min: int):
     radii = np.array([r for _, _, r in raw])
     median_r = float(np.median(radii))
     filtered = [(x, y, r) for (x, y, r) in raw if abs(r - median_r) <= 0.25 * median_r]
-    return _merge_close_circles(filtered, median_r)
+    merged = _merge_close_circles(filtered, median_r)
+    return _remove_isolated_circles(merged)
 
 
 def _kmeans_1d(values, k) -> np.ndarray:
@@ -100,21 +122,29 @@ def _kmeans_1d(values, k) -> np.ndarray:
     return np.array([rank[label] for label in labels])
 
 
+MIN_SECTION_FRACTION = 0.80  # mínimo de círculos esperados por sección para intentar procesarla
+MIN_GOOD_ROWS_FRACTION = 0.5  # mínimo de filas "completas" (4 círculos) para calibrar columnas
+
+
 def build_bubble_grid(img: np.ndarray) -> dict:
-    """Detecta y agrupa los 400 círculos de la hoja. Devuelve
+    """Detecta y agrupa los círculos de la hoja. Devuelve
     {seccion: {pregunta: {letra: (cx, cy, r)}}} (centro y radio del círculo,
     no un rectángulo) para poder medir solo el interior del círculo y evitar
-    contar el propio borde impreso. Lanza OmrError si el conteo no coincide
-    con el formato esperado de la hoja."""
+    contar el propio borde impreso.
+
+    Es tolerante a que falten o sobren uno o dos círculos sueltos (ruido de
+    la foto, marcas del alumno fuera de lugar, etc.): en vez de exigir un
+    conteo exacto, calibra la posición de las 4 columnas (A/B/C/D) usando las
+    filas que sí se detectaron completas, y para las filas incompletas asigna
+    cada círculo encontrado a la columna más cercana. Una opción sin círculo
+    detectado en su fila queda simplemente "sin dato" (se trata como no
+    marcada al leer la respuesta) en vez de invalidar toda la foto.
+    Solo lanza OmrError si una sección tiene demasiados pocos círculos como
+    para ser confiable."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     h = gray.shape[0]
 
     circles = _detect_circles(gray, y_min=int(h * 0.12))
-    if len(circles) != EXPECTED_TOTAL:
-        raise OmrError(
-            f"Se detectaron {len(circles)} círculos, se esperaban {EXPECTED_TOTAL}. "
-            "Verifica que la foto muestre la hoja completa, bien iluminada y sin recortes."
-        )
 
     xs = np.array([c[0] for c in circles])
     ys = np.array([c[1] for c in circles])
@@ -123,31 +153,47 @@ def build_bubble_grid(img: np.ndarray) -> dict:
     section_labels = _kmeans_1d(xs, N_SECTIONS)
     grid: dict = {name: {} for name in SECTION_NAMES}
 
+    expected_section_total = N_QUESTIONS * len(LETTERS)
+
     for section_idx, sec_name in enumerate(SECTION_NAMES):
         sec_mask = np.where(section_labels == section_idx)[0]
-        expected_section_total = N_QUESTIONS * len(LETTERS)
-        if len(sec_mask) != expected_section_total:
+        if len(sec_mask) < expected_section_total * MIN_SECTION_FRACTION:
             raise OmrError(
                 f"Sección {sec_name}: se detectaron {len(sec_mask)} círculos, "
-                f"se esperaban {expected_section_total}."
+                f"se esperaban {expected_section_total}. Verifica que la foto "
+                "muestre la hoja completa, bien iluminada y sin recortes."
             )
 
         row_labels_local = _kmeans_1d(ys[sec_mask], N_QUESTIONS)
-
+        rows_idx = []
         for row in range(N_QUESTIONS):
             row_idx = sec_mask[np.where(row_labels_local == row)[0]]
-            if len(row_idx) != len(LETTERS):
-                raise OmrError(
-                    f"Sección {sec_name}, fila {row + 1}: se detectaron "
-                    f"{len(row_idx)} círculos, se esperaban {len(LETTERS)}."
-                )
             row_idx = row_idx[np.argsort(xs[row_idx])]
+            rows_idx.append(row_idx)
+
+        good_rows = [r for r in rows_idx if len(r) == len(LETTERS)]
+        if len(good_rows) < N_QUESTIONS * MIN_GOOD_ROWS_FRACTION:
+            raise OmrError(
+                f"Sección {sec_name}: solo {len(good_rows)} de {N_QUESTIONS} "
+                "filas se detectaron completas, no es suficiente para "
+                "calibrar las columnas. Verifica la foto."
+            )
+
+        col_centers = [
+            float(np.median([xs[r[k]] for r in good_rows])) for k in range(len(LETTERS))
+        ]
+
+        for row, row_idx in enumerate(rows_idx):
             q_num = str(row + 1)
-
-            options = {}
-            for letter, gi in zip(LETTERS, row_idx):
-                options[letter] = (float(xs[gi]), float(ys[gi]), float(radii[gi]))
-
+            options: dict = {}
+            used_cols: set = set()
+            for gi in row_idx:
+                order = sorted(range(len(LETTERS)), key=lambda k: abs(xs[gi] - col_centers[k]))
+                for k in order:
+                    if k not in used_cols:
+                        used_cols.add(k)
+                        options[LETTERS[k]] = (float(xs[gi]), float(ys[gi]), float(radii[gi]))
+                        break
             grid[sec_name][q_num] = options
 
     return grid
@@ -223,7 +269,12 @@ def read_answers(img: np.ndarray) -> dict:
     for section, questions in grid.items():
         respuestas[section] = {}
         for q_num, options in questions.items():
-            scores = {letter: _fill_intensity(gray, circle) for letter, circle in options.items()}
+            scores = {}
+            for letter in LETTERS:
+                if letter in options:
+                    scores[letter] = _fill_intensity(gray, options[letter])
+                else:
+                    scores[letter] = 255.0  # no se detectó el círculo; se asume sin tinta
             respuestas[section][q_num] = _classify_question(scores)
 
     return respuestas
