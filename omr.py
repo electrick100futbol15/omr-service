@@ -176,10 +176,38 @@ def _fill_intensity(gray: np.ndarray, circle, inner_ratio: float = 0.7) -> float
     return float(mean_val)
 
 
+MIN_GAP = 10.0  # separación mínima de intensidad para considerar un "salto" real
+
+
+def _classify_question(scores: dict) -> str:
+    """Decide la respuesta de una pregunta a partir de las 4 intensidades.
+
+    Ordena las intensidades (menor = más tinta) y busca el mayor salto entre
+    valores consecutivos. Ese salto separa el grupo de círculos "marcados"
+    (más oscuros) del grupo "en blanco". Esto detecta automáticamente:
+      - una sola opción marcada -> se devuelve esa letra.
+      - ninguna opción marcada (salto máximo muy pequeño) -> "" (en blanco).
+      - dos o más opciones marcadas -> "MULTIPLE:X,Y" (respuesta inválida,
+        requiere revisión manual del maestro).
+    """
+    items = sorted(scores.items(), key=lambda kv: kv[1])
+    values = [v for _, v in items]
+    gaps = [values[i + 1] - values[i] for i in range(len(values) - 1)]
+    max_gap_idx = max(range(len(gaps)), key=lambda i: gaps[i])
+    max_gap = gaps[max_gap_idx]
+
+    if max_gap < MIN_GAP:
+        return ""
+
+    marcadas = [items[i][0] for i in range(max_gap_idx + 1)]
+    if len(marcadas) == 1:
+        return marcadas[0]
+    return "MULTIPLE:" + ",".join(sorted(marcadas))
+
+
 def read_answers(img: np.ndarray) -> dict:
-    """Punto de entrada principal: detecta la cuadrícula y lee la respuesta
-    marcada (menor intensidad promedio = más tinta = respuesta elegida) para
-    cada pregunta de cada sección."""
+    """Punto de entrada principal: detecta la cuadrícula y clasifica la
+    respuesta de cada pregunta de cada sección (ver _classify_question)."""
     grid = build_bubble_grid(img)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
@@ -188,6 +216,6 @@ def read_answers(img: np.ndarray) -> dict:
         respuestas[section] = {}
         for q_num, options in questions.items():
             scores = {letter: _fill_intensity(gray, circle) for letter, circle in options.items()}
-            respuestas[section][q_num] = min(scores, key=scores.get)
+            respuestas[section][q_num] = _classify_question(scores)
 
     return respuestas
