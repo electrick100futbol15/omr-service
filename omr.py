@@ -176,33 +176,41 @@ def _fill_intensity(gray: np.ndarray, circle, inner_ratio: float = 0.7) -> float
     return float(mean_val)
 
 
-MIN_GAP = 10.0  # separación mínima de intensidad para considerar un "salto" real
+RANGE_MIN = 12.0  # contraste mínimo (más oscuro vs más claro) para asumir que hay tinta
+REL_GAP = 0.25  # fracción del contraste total que separa "marcado" de "en blanco"
 
 
 def _classify_question(scores: dict) -> str:
-    """Decide la respuesta de una pregunta a partir de las 4 intensidades.
+    """Decide la respuesta de una pregunta a partir de las 4 intensidades
+    (menor intensidad = más tinta).
 
-    Ordena las intensidades (menor = más tinta) y busca el mayor salto entre
-    valores consecutivos. Ese salto separa el grupo de círculos "marcados"
-    (más oscuros) del grupo "en blanco". Esto detecta automáticamente:
-      - una sola opción marcada -> se devuelve esa letra.
-      - ninguna opción marcada (salto máximo muy pequeño) -> "" (en blanco).
-      - dos o más opciones marcadas -> "MULTIPLE:X,Y" (respuesta inválida,
-        requiere revisión manual del maestro).
+    En vez de un umbral fijo en píxeles (que no se adapta bien a fotos con
+    distinta iluminación/contraste), se usa una fracción relativa del
+    contraste total de esa pregunta (más oscura vs más clara):
+      1. Si el contraste total es muy bajo, no hay tinta real -> "" (blanco).
+      2. Si el salto entre la más oscura y la 2da más oscura ya es una
+         fracción grande del contraste total -> una sola marcada.
+      3. Si no, pero el salto entre la 2da y la 3ra sí lo es -> dos marcadas
+         ("MULTIPLE:X,Y", inválida, requiere revisión del maestro).
+      4. Si ningún salto destaca claramente (caso ambiguo/ruidoso), se
+         devuelve la más oscura como mejor estimación, igual que antes.
     """
     items = sorted(scores.items(), key=lambda kv: kv[1])
     values = [v for _, v in items]
-    gaps = [values[i + 1] - values[i] for i in range(len(values) - 1)]
-    max_gap_idx = max(range(len(gaps)), key=lambda i: gaps[i])
-    max_gap = gaps[max_gap_idx]
+    total_range = values[-1] - values[0]
 
-    if max_gap < MIN_GAP:
+    if total_range < RANGE_MIN:
         return ""
 
-    marcadas = [items[i][0] for i in range(max_gap_idx + 1)]
-    if len(marcadas) == 1:
-        return marcadas[0]
-    return "MULTIPLE:" + ",".join(sorted(marcadas))
+    gap01 = (values[1] - values[0]) / total_range
+    if gap01 >= REL_GAP:
+        return items[0][0]
+
+    gap12 = (values[2] - values[1]) / total_range
+    if gap12 >= REL_GAP:
+        return "MULTIPLE:" + ",".join(sorted([items[0][0], items[1][0]]))
+
+    return items[0][0]
 
 
 def read_answers(img: np.ndarray) -> dict:
