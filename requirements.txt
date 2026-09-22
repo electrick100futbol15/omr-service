@@ -3,3 +3,4 @@ uvicorn[standard]==0.34.0
 opencv-python-headless==4.10.0.84
 numpy==2.2.1
 python-multipart==0.0.20
+pymupdf==1.25.2
