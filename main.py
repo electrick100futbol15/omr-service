@@ -13,8 +13,9 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 
 from omr import OmrError, read_answers
+from pdf_key import PdfKeyError, extract_key_from_bytes
 
-app = FastAPI(title="OMR Service", version="0.2.0")
+app = FastAPI(title="OMR Service", version="0.3.0")
 
 
 def decode_image(data: bytes) -> np.ndarray:
@@ -43,3 +44,15 @@ async def procesar_hoja(file: UploadFile = File(...)):
     alumno = os.path.splitext(file.filename or "pendiente")[0]
 
     return JSONResponse({"alumno": alumno, "respuestas": respuestas})
+
+
+@app.post("/extraer-clave")
+async def extraer_clave(file: UploadFile = File(...)):
+    data = await file.read()
+
+    try:
+        clave = extract_key_from_bytes(data)
+    except PdfKeyError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    return JSONResponse({"respuestas_correctas": clave})
