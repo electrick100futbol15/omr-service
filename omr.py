@@ -22,7 +22,7 @@ import cv2
 N_SECTIONS = 4
 LETTERS = ["A", "B", "C", "D"]
 N_QUESTIONS = 25
-SECTION_NAMES = ["Lenguajes", "Saberes_y_PC", "Etica_N_y_S", "Humanidades"]
+SECTION_NAMES = [f"Seccion_{i + 1}" for i in range(N_SECTIONS)]  # posicional: columna 1, 2, 3, 4 de la hoja física
 
 EXPECTED_TOTAL = N_SECTIONS * N_QUESTIONS * len(LETTERS)
 
