@@ -2,51 +2,44 @@
 Extractor determinístico de la clave de respuestas correctas desde el PDF
 del examen (el "solucionario" con las respuestas resaltadas en amarillo).
 
-No usa IA/OCR/modelos de lenguaje: el resaltado amarillo en este PDF es un
-rectángulo vectorial de relleno puro (1.0, 1.0, 0.0) dibujado sobre el texto,
-no una anotación. El proceso es:
-  1. Ubicar todos los rectángulos amarillos de cada página y fusionar los que
-     pertenecen a la misma opción (una respuesta larga puede resaltarse en
-     2+ líneas/rectángulos consecutivos).
+No usa IA/OCR/modelos de lenguaje. El proceso es:
+  1. Ubicar todos los rectángulos amarillos de cada página (relleno vectorial
+     puro (1.0, 1.0, 0.0), no una anotación) y fusionar los que pertenecen a
+     la misma opción (una respuesta larga puede resaltarse en 2+ líneas).
   2. Extraer el texto contenido en cada rectángulo fusionado y tomar la letra
      de opción (a/b/c/d) que contiene.
   3. Ubicar los números de pregunta ("1.", "2.", ...) como palabras sueltas
      en la página.
-  4. Recorrer preguntas y resaltados de TODO el documento en orden real de
+  4. Detectar el inicio de una materia nueva: la página donde aparece la
+     pregunta "1." SIEMPRE contiene también el título de esa materia escrito
+     en una fuente mucho más grande que el resto del texto (tamaño >= 30,
+     frente a 12-18 del cuerpo del examen). Esto identifica materias por
+     ORDEN de aparición y por su título real impreso, sin depender de que el
+     nombre sea uno de un catálogo fijo — así cualquier título nuevo que la
+     maestra use en un examen futuro se reconoce igual.
+  5. Recorrer preguntas y resaltados de TODO el documento en orden real de
      lectura (columna izquierda de arriba a abajo, luego columna derecha,
      luego la siguiente página) llevando un contador de "pregunta actual",
      de modo que una respuesta resaltada que queda partida entre columnas o
      entre páginas se asigne correctamente a su pregunta.
 
-Asume el formato fijo de este examen (mismo generador/plantilla): los
-encabezados de materia son siempre "Lenguajes", "Saberes y P...",
-"Ética, N...", "De lo Hum...".
+Asume el formato fijo de la hoja física de respuestas: siempre hay 4
+materias (secciones) con hasta 25 preguntas cada una. Los nombres de las
+materias se identifican por posición (Seccion_1, Seccion_2, ...) más el
+título real detectado, no por texto fijo esperado.
 """
 
 import re
 
 import fitz
 
-SECTION_MARKERS = [
-    ("Lenguajes", "Lenguajes"),
-    ("Saberes y P", "Saberes_y_PC"),
-    ("Ética, N", "Etica_N_y_S"),
-    ("De lo Hum", "Humanidades"),
-]
-
 QNUM_RE = re.compile(r"^(\d{1,2})\.$")
 OPT_RE = re.compile(r"([a-dA-D])\)")
+TITLE_MIN_SIZE = 30  # los títulos de materia usan una fuente mucho más grande que el cuerpo del examen
 
 
 class PdfKeyError(Exception):
     """Error determinístico y explicable al extraer la clave del PDF."""
-
-
-def _detect_section(text: str):
-    for marker, name in SECTION_MARKERS:
-        if marker in text:
-            return name
-    return None
 
 
 def _column_of(x0: float, page_width: float) -> int:
@@ -80,19 +73,44 @@ def _merge_yellow_rects(rects, y_gap: float = 22):
     return groups
 
 
+def _page_starts_question_one(page) -> bool:
+    for w in page.get_text("words"):
+        m = QNUM_RE.match(w[4])
+        if m and m.group(1) == "1":
+            return True
+    return False
+
+
+def _page_title(page) -> str:
+    spans = []
+    for block in page.get_text("dict")["blocks"]:
+        if "lines" not in block:
+            continue
+        for line in block["lines"]:
+            for span in line["spans"]:
+                text = span["text"].strip()
+                if text and span["size"] >= TITLE_MIN_SIZE:
+                    spans.append((span["bbox"][1], text))
+    spans.sort(key=lambda s: s[0])
+    return " ".join(text for _, text in spans).strip()
+
+
 def extract_key_from_bytes(pdf_bytes: bytes) -> dict:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     result: dict = {}
+    titulos: dict = {}
     current_section = None
     current_question = None
+    section_count = 0
 
     for page in doc:
-        page_text = page.get_text("text")
-        sec = _detect_section(page_text)
-        if sec:
-            current_section = sec
+        if _page_starts_question_one(page):
+            section_count += 1
+            current_section = f"Seccion_{section_count}"
             current_question = None
-            result.setdefault(current_section, {})
+            titulo = _page_title(page)
+            result[current_section] = {}
+            titulos[current_section] = titulo or current_section
 
         if current_section is None:
             continue
@@ -128,25 +146,27 @@ def extract_key_from_bytes(pdf_bytes: bytes) -> dict:
 
     if not result:
         raise PdfKeyError(
-            "No se detectó ninguna materia conocida en el PDF. Verifica que "
-            "sea el examen con el formato esperado."
+            "No se detectó ninguna materia en el PDF. Verifica que sea el "
+            "examen con el formato esperado (título grande de la materia en "
+            "la misma página donde inicia la pregunta 1)."
         )
 
     # La hoja de respuestas física tiene capacidad fija para 25 preguntas por
     # materia; el examen puede usar menos (filas de más quedan en blanco),
     # pero nunca más de 25 sin cambiar también la hoja impresa.
     for materia, preguntas in result.items():
+        nombre = titulos.get(materia, materia)
         if len(preguntas) == 0:
             raise PdfKeyError(
-                f"Materia '{materia}': no se detectó ninguna respuesta "
+                f"Materia '{nombre}': no se detectó ninguna respuesta "
                 "resaltada. Verifica que las respuestas correctas estén "
                 "resaltadas en amarillo."
             )
         if len(preguntas) > 25:
             raise PdfKeyError(
-                f"Materia '{materia}': se detectaron {len(preguntas)} "
+                f"Materia '{nombre}': se detectaron {len(preguntas)} "
                 "respuestas resaltadas, y la hoja de respuestas solo tiene "
                 "25 preguntas por materia. Revisa el PDF."
             )
 
-    return result
+    return {"respuestas_correctas": result, "titulos": titulos}
