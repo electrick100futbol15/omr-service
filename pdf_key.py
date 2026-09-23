@@ -132,12 +132,21 @@ def extract_key_from_bytes(pdf_bytes: bytes) -> dict:
             "sea el examen con el formato esperado."
         )
 
+    # La hoja de respuestas física tiene capacidad fija para 25 preguntas por
+    # materia; el examen puede usar menos (filas de más quedan en blanco),
+    # pero nunca más de 25 sin cambiar también la hoja impresa.
     for materia, preguntas in result.items():
-        if len(preguntas) != 25:
+        if len(preguntas) == 0:
+            raise PdfKeyError(
+                f"Materia '{materia}': no se detectó ninguna respuesta "
+                "resaltada. Verifica que las respuestas correctas estén "
+                "resaltadas en amarillo."
+            )
+        if len(preguntas) > 25:
             raise PdfKeyError(
                 f"Materia '{materia}': se detectaron {len(preguntas)} "
-                "respuestas resaltadas, se esperaban 25. Verifica que todas "
-                "las respuestas correctas estén resaltadas en amarillo."
+                "respuestas resaltadas, y la hoja de respuestas solo tiene "
+                "25 preguntas por materia. Revisa el PDF."
             )
 
     return result
